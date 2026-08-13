@@ -1,56 +1,57 @@
-# ============================================================
-# config.py — الثوابت العامة (استبدلها بروابطك الحقيقية لاحقاً)
-# ============================================================
+# -*- coding: utf-8 -*-
+"""
+config.py — الثوابت والإعدادات العامة للأداة
+============================================
+Free Fire Master Control — إعدادات التحكم بـ 100+ حساب.
+"""
+import os
 
-# نقطة نهاية وهمية — استبدلها فقط عندما يكون لديك تفويض على الهدف
-FREEFIRE_API_URL = "https://garena.mock"
-FF_PROFILE_ENDPOINT = f"{FREEFIRE_API_URL}/api/v1/profile"
-FF_SESSION_ENDPOINT = f"{FREEFIRE_API_URL}/api/v1/session/validate"
+# ---------- قاعدة البيانات ----------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "freefire.db")
+ACCOUNTS_TABLE = "accounts"
+REG_QUEUE_TABLE = "reg_queue"
 
-USER_AGENT = "Mozilla/5.0 (Linux; Android 13) FreeFire/1.99.2"
+# ---------- الشبكة العامة ----------
+MAX_CONCURRENCY = 30          # حد التوازي أثناء الفحص الجماعي (30–50 حسب جودة البروكسيات)
+CHECK_TIMEOUT = 10            # مهلة طلب الفحص (ثانية)
+USER_AGENT = "ff-control/1.0"
 
-# مهلة الطلب الواحد بالثواني
-REQUEST_TIMEOUT = 10
+# ---------- نقاط النهاية ----------
+# تحذير: garena.mock وهمية — استبدلها فقط بنقطة نهاية تملكها أو فُوِّضت باختبارها.
+API_BASE = os.environ.get("FF_API_BASE", "https://garena.mock")
+PLAYER_ENDPOINT = f"{API_BASE}/player"
+REGISTER_ENDPOINT = os.environ.get("FF_REGISTER_ENDPOINT", f"{API_BASE}/register")
 
-# الحد الأقصى للطلبات المتزامنة — لـ 100 حساب ارفعه تدريجياً إلى 30-50
-MAX_CONCURRENCY = 30
-
-# عدد محاولات إعادة الطلب عند أخطاء 429 / 5xx
-RETRY_ATTEMPTS = 3
-
-# فاصل زمني عشوائي بين الطلبات — توزيع حمل مهذّب على السيرفر
-BASE_DELAY_MIN = 1.0
-BASE_DELAY_MAX = 3.0
-
-# ملفات
-DB_PATH = "freefire.db"
-PROXIES_FILE = "proxies.txt"
-
-# ============================================================
-# إدارة البروكسيات الذكية (Proxy Manager)
-# ============================================================
-
-# الحد الأدنى للبروكسيات الحية — تصميم 100 حساب => 100 بروكسي
-MIN_PROXIES = 100
-# سقف التخزين (يُقتلم بالأفضل نقاطاً)
-MAX_PROXIES = 300
-# ثوانٍ بين جولات إعادة التعبئة/التحقق في الخلفية
-REFILL_INTERVAL = 45
-# عدد الإخفاقات المتتالية قبل اعتبار البروكسي ميتاً
-PROXY_FAIL_THRESHOLD = 2
-# تفعيل إعادة التعبئة التلقائية
-AUTO_REFILL = True
-
-# نقطة تحقق عامة لاختبار حيوية البروكسي (تعيد 200 + IP)
-VALIDATION_URL = "https://api.ipify.org?format=json"
-VALIDATION_TIMEOUT = 6
-VALIDATION_CONCURRENCY = 15
-
-# المصادر المجانية — type=plain يعني سطر لكل proxy (host:port)
+# ---------- البروكسيات ----------
+MIN_PROXIES = 100             # الحد الأدنى للمخزون الحي (يساوي عدد الحسابات)
+MAX_PROXIES = 300             # سقف المخزون
 PROXY_SOURCES = [
-    {"url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "type": "plain"},
-    {"url": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt", "type": "plain"},
-    {"url": "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt", "type": "plain"},
-    {"url": "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all", "type": "plain"},
-    {"url": "https://www.proxy-list.download/api/v1/get?type=http", "type": "plain"},
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
 ]
+PROXY_VALIDATE_CONCURRENCY = 15   # توازي التحقق من البروكسيات
+PROXY_VALIDATE_TIMEOUT = 6        # مهلة اختبار البروكسي (ثانية)
+PROXY_VALIDATE_URL = "http://www.gstatic.com/generate_204"  # نقطة اختبار خفيفة
+PROXY_FETCH_INTERVAL = 300        # جلب دوري كل 5 دقائق (ثانية)
+PROXY_VALIDATE_INTERVAL = 600     # إعادة فحص دورية كل 10 دقائق
+PROXY_MIN_SCORE = 1.0             # تحت هذه النقطة يُسقط البروكسي
+PROXY_FAIL_THRESHOLD = 2          # إخفاقات متتالية = ميت
+PROXY_SUSPICIOUS_TIME = 3.0       # زمن > 3 ث = "مريب"
+PROXY_MAX_AGE = 900               # يُسقط البروكسي بعد 15 دقيقة بلا نجاح
+
+# ---------- التسجيل الذاتي (Auto-Register) ----------
+REG_CONCURRENCY = 5           # حد التوازي أثناء التسجيل
+REG_TIMEOUT = 15              # مهلة طلب التسجيل (ثانية)
+REG_MAX_RETRIES = 3
+REG_DELAY_MIN = 0.5           # تهدئة عشوائية بين المحاولات (ثانية)
+REG_DELAY_MAX = 2.0
+CRED_ID_DIGITS = 11           # طول معرّف اللاعب (مثل معرّفات الضيف)
+CRED_TOKEN_BYTES = 24         # حجم التوكن العشوائي
+
+# ---------- إعادة المحاولة ----------
+CHECK_MAX_RETRIES = 3
+RETRY_BASE_DELAY = 1.0        # أساس التراجع الأسي (1s → 2s → 4s)
+RETRY_MAX_DELAY = 8.0
+RETRY_JITTER = 0.3            # نسبة الاهتزاز العشوائي
