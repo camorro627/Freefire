@@ -4,18 +4,17 @@ master_cli.py — واجهة camorro التفاعلية (cmd)
 =============================================
 أوامر: add_account / remove_account / import_accounts / export_accounts /
 list_accounts / count_accounts / check_player / mass_status /
-proxy_status / fetch_proxies / validate_proxies / auto_refill /
-show_proxies / auto_register / reg_status / reg_retry / exit
+send_likes / proxy_status / fetch_proxies / validate_proxies / auto_refill /
+show_proxies / auto_register / reg_listen / reg_status / reg_retry / exit
 """
 import cmd
 import sys
 import threading
-import time
 
 import config
 import db
 from proxy_manager import ProxyManager
-from worker_engine import check_player_sync, mass_status_sync
+from worker_engine import (check_player_sync, mass_like_sync, mass_status_sync)
 
 
 def _print_table(rows, headers):
@@ -32,8 +31,9 @@ def _print_table(rows, headers):
 
 class MasterCLI(cmd.Cmd):
     intro = (
-        "\n=== Free Fire Master Control (camorro) ===\n"
-        "اكتب help لعرض الأوامر. auto_register 5 لإنشاء حسابات تلقائياً.\n"
+        "\n=== Free Fire Master Control (camorro) v1.1 ===\n"
+        "check_player <ID> [region] لفحص أي لاعب | reg_listen لاستقبال "
+        "حسابات الضيوف | send_likes <ID> لإرسال لايكات.\n"
     )
     prompt = "> "
 
@@ -43,6 +43,7 @@ class MasterCLI(cmd.Cmd):
         self.pm = ProxyManager()
         self.pm.start()
         self.reg_thread = None
+        self.listener = None
 
     # ---------- الحسابات ----------
     def do_add_account(self, arg):
@@ -56,19 +57,21 @@ class MasterCLI(cmd.Cmd):
 
     def do_remove_account(self, arg):
         """remove_account <ID> — حذف حساب"""
-        if not arg.strip():
+        pid = arg.strip()
+        if not pid:
             print("الاستخدام: remove_account <player_id>")
             return
-        print("تم الحذف" if db.remove_account(arg.strip()) else "غير موجود")
+        print("حُذف الحساب" if db.remove_account(pid) else "الحساب غير موجود")
 
     def do_import_accounts(self, arg):
         """import_accounts <file.csv> — استيراد جماعي (player_id,access_token[,status])"""
-        if not arg.strip():
+        path = arg.strip()
+        if not path:
             print("الاستخدام: import_accounts <file.csv>")
             return
         try:
-            n = db.import_csv(arg.strip())
-            print(f"استُورد {n} حساب جديد.")
+            n = db.import_csv(path)
+            print(f"استُورد {n} حساب جديد من {path}")
         except Exception as e:
             print(f"فشل الاستيراد: {e}")
 
@@ -107,21 +110,21 @@ class MasterCLI(cmd.Cmd):
 
     # ---------- الفحص ----------
     def do_check_player(self, arg):
-        """check_player <ID> — جلب الملف (Nickname / Level / Likes)"""
-        pid = arg.strip()
-        if not pid:
-            print("الاستخدام: check_player <player_id>")
+        """check_player <ID> [region] — فحص أي لاعب: Level / Rank / Clan / Likes"""
+        parts = arg.split()
+        if not parts:
+            print("الاستخدام: check_player <player_id> [region]")
             return
-        print(f"فحص {pid} ...")
-        r = check_player_sync(pid, self.pm)
-        if not r:
-            print("الحساب غير مسجل في قاعدة البيانات.")
+        pid = parts[0]
+        region = parts[1] if len(parts) > 1 else config.DEFAULT_REGION
+        print(f"فحص {pid} ({region}) ...")
+        r = check_player_sync(pid, region, self.pm)
+        if not r or not r.ok:
+            print(f"[X] {r.error if r else 'فشل الفحص'} — تأكد من FF_API_KEY والاتصال.")
             return
-        if r.ok:
-            print(f"[OK] {r.nickname or '?'} | Level {r.level} | Likes {r.likes} "
-                  f"| عبر {r.proxy or 'مباشر'} | {r.elapsed:.2f}s")
-        else:
-            print(f"[X] {r.status or r.error} | عبر {r.proxy or 'مباشر'} | {r.elapsed:.2f}s")
+        likes = f" | Likes {r.likes}" if r.source == "internal-profile" else ""
+        print(f"[OK] {r.nickname or '?'} | Level {r.level} | Rank {r.rank} "
+              f"| Clan {r.clan or '-'}{likes} | {r.elapsed:.2f}s")
 
     def do_mass_status(self, arg):
         """mass_status — فحص كل الحسابات بالتوازي مع تقرير تقدم"""
@@ -140,8 +143,39 @@ class MasterCLI(cmd.Cmd):
             if r.ok:
                 print(f"[OK] {r.player_id} | {r.nickname} | Lv{r.level} | {r.elapsed:.2f}s")
             else:
-                print(f"[X] {r.player_id} | {r.status or r.error}")
+                print(f"[X] {r.player_id} | {r.error}")
         print(f"\nالنتيجة: {ok}/{total} نجحت.")
+
+    # ---------- اللايكات ----------
+    def do_send_likes(self, arg):
+        """send_likes <target_uid> [region] [max_accounts] — لايك من كل حساب نشط"""
+        parts = arg.split()
+        if not parts:
+            print("الاستخدام: send_likes <target_uid> [region] [max_accounts]")
+            return
+        target = parts[0]
+        region = parts[1] if len(parts) > 1 else config.DEFAULT_REGION
+        try:
+            max_acc = int(parts[2]) if len(parts) > 2 else config.LIKE_MAX_ACCOUNTS
+        except ValueError:
+            max_acc = config.LIKE_MAX_ACCOUNTS
+
+        print(f"إرسال لايكات إلى {target} ({region}) من حتى {max_acc} حساب ...")
+
+        def cb(done, total, o):
+            mark = "[OK]" if o.ok else "[X]"
+            print(f"\r{mark} {o.player_id} ({done}/{total})", end="", flush=True)
+
+        results, total = mass_like_sync(
+            target, region, max_acc, self.pm,
+            provider=config.LIKE_PROVIDER, progress_cb=cb,
+        )
+        if not total:
+            print("\nلا توجد حسابات نشطة — استقبل حسابات أولاً: reg_listen ثم شغّل المزرعة.")
+            return
+        ok = sum(1 for r in results if r.ok)
+        print(f"\nالنتيجة: {ok}/{total} لايك ناجح. "
+              f"(المزوّد: {config.LIKE_PROVIDER})")
 
     # ---------- البروكسيات ----------
     def do_proxy_status(self, arg):
@@ -184,16 +218,26 @@ class MasterCLI(cmd.Cmd):
             ["البروكسي", "متوسط الزمن", "النقاط", "نجاح/فشل", "حي"],
         )
 
-    # ---------- التسجيل الذاتي ----------
+    # ---------- إنشاء/استقبال الحسابات ----------
+    def do_reg_listen(self, arg):
+        """reg_listen [port] — استقبال حسابات الضيوف من frida_guest.js (خلفية)"""
+        port = int(arg.strip()) if arg.strip().isdigit() else config.REG_LISTEN_PORT
+        from registrar import start_listener
+        self.listener = start_listener(port=port)
+        print(f"[CLI] المستمع يعمل على المنفذ {port}.")
+        print(f"[CLI] على المحاكي: frida -U -f {PACKAGE_HINT} -l guest_farm/frida_guest.js")
+        print(f"[CLI] ثم عدّل TERMUX_URL داخل السكربت إلى IP جهاز Termux.")
+
     def do_auto_register(self, arg):
-        """auto_register [N] — إنشاء N حساب تلقائياً (افتراضي 5) ثم التحكم بها"""
+        """auto_register [N] — طلب N حساب حقيقي من المزرعة (FF_FARM_ENDPOINT)"""
         try:
             count = int(arg.strip() or 5)
         except ValueError:
             count = 5
         from registrar import start_registration
         self.reg_thread = start_registration(count=count, proxy_manager=self.pm)
-        print(f"[CLI] بدأت دورة تسجيل {count} حساب في الخلفية. تابع بـ reg_status.")
+        print(f"[CLI] بدأت دورة طلب {count} حساب من المزرعة في الخلفية.")
+        print("[CLI] إن لم تضبط FF_FARM_ENDPOINT استخدم reg_listen لاستقبال الحسابات من المحاكي.")
 
     def do_reg_status(self, arg):
         """reg_status — تقرير مهام التسجيل (pending/done/failed)"""
