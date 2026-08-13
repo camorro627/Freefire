@@ -1,19 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-registrar.py — التسجيل الذاتي للحسابات (Auto-Register)
-======================================================
-ميزة جديدة: الأداة تنشئ N حساباً بنفسها وتخزن بياناتها في freefire.db
-ليتحكم بها السيد عبر master_cli كأي حساب مستورد.
-
-البنية:
-  * generate_credentials()   : توليد player_id + access_token
-  * register_account()       : المفصل القابل للاستبدال (Mock افتراضياً)
-  * RegistrationManager      : تنفيذ متوازٍ + تراجع أسي + بروكسي لكل حساب
-  * جدول reg_queue           : تتبع المهام (pending -> done/failed)
-
-النطاق: register_account تستدعي REGISTER_ENDPOINT من config.py —
-الافتراضي "https://garena.mock" (محاكاة). استبدلها فقط بنقطة نهاية
-تملكها أو فُوِّضت باختبارها.
+registrar.py — إنشاء واستقبال الحسابات الحقيقية
+===============================================
+ما الذي تغيّر عن النسخة الوهمية؟
+* register_account: لم تعد تولّد بيانات عشوائية. تطلب حساب ضيف حقيقي
+  من خدمة المزرعة (FF_FARM_ENDPOINT) — مثل freefire-jwt-generator-api
+  أو أي واجهة تعيد {"uid": ..., "access_token": ...}.
+* RegListener: خادم HTTP يستقبل حسابات الضيوف الحقيقية القادمة من
+  frida_guest.js على المحاكي (POST /ingest) ويخزّنها في freefire.db.
+* قيود واقعية مدمجة:
+  - حساب الضيف = لايك واحد فقط لكل هدف (قيد Garena).
+  - Garena يراقب الأنماط الجماعية (نفس الجهاز/البروكسي) —
+    وزّع المزرعة على محاكيات وبروكسيات مختلفة.
 """
 import asyncio
 import random
@@ -25,21 +23,21 @@ import time
 from dataclasses import dataclass
 
 import aiohttp
+from aiohttp import web
 
 import config
 import db
 
 
-# ---------- توليد بيانات الاعتماد ----------
+# ---------- توليد معرّف المهمة (وليس بيانات الحساب!) ----------
 def generate_player_id(digits=None):
-    """معرّف رقمي عشوائي (الرقم الأول غير صفري) شبيه بمعرّفات الضيف."""
+    """معرّف مؤقت لسطر الطابور فقط — الحساب الحقيقي يأتي من المزرعة."""
     digits = digits or config.CRED_ID_DIGITS
     first = random.choice(string.digits[1:])
     return first + "".join(random.choices(string.digits, k=digits - 1))
 
 
 def generate_access_token(nbytes=None):
-    """توكن جلسة عشوائي آمن إحصائياً."""
     return secrets.token_hex(nbytes or config.CRED_TOKEN_BYTES)
 
 
@@ -60,62 +58,51 @@ class RegNetworkError(Exception):
     """خطأ شبكة/بروكسي/5xx — قابل لإعادة المحاولة."""
 
 
-# ---------- المفصل القابل للاستبدال ----------
-async def register_account(session, player_id, access_token, proxy=None, **ctx):
+# ---------- طلب حساب حقيقي من المزرعة ----------
+async def register_account(session, player_id, region=None, proxy=None, ua=None):
+    """يطلب حساب ضيف حقيقياً من مزرعة الحسابات.
+
+    FF_FARM_ENDPOINT: عنوان خدمة المزرعة التي تُنشئ الحسابات داخل اللعبة
+    (أو خادم freefire-jwt-generator-api) وتُرجع
+    {"uid": ..., "access_token": ...}.
+    عند عدم ضبطه تُرفع RegNetworkError وتُحال المهمة للمستمع.
     """
-    ينفّذ طلب التسجيل الفعلي.
-
-    الوضع الافتراضي (Mock): نجاح 85% + 429/5xx/403 عشوائية لتجربة الدورة
-    كاملة (قائمة مهام -> توازٍ -> تخزين -> تحكم) دون شبكة حقيقية.
-
-    للتوصيل بنقطة نهاية حقيقية تملكها: فعّل الكود المعلَّق بالأسفل.
-    """
-    if config.REGISTER_ENDPOINT.endswith(".mock") or not config.REGISTER_ENDPOINT:
-        await asyncio.sleep(random.uniform(0.3, 1.0))
-        r = random.random()
-        if r < 0.85:
-            return {"ok": True, "player_id": player_id, "access_token": access_token}
-        if r < 0.92:
-            raise RegRateLimited("429 mock")
-        if r < 0.97:
-            raise RegNetworkError("5xx mock")
-        raise RegBlocked("403 mock")
-
-    # ----- التوصيل الحقيقي (فعّله عند امتلاك/تفويض نقطة النهاية) -----
-    payload = {"player_id": player_id, "access_token": access_token}
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": ctx.get("ua", config.USER_AGENT),
-    }
+    if not config.FF_FARM_ENDPOINT:
+        raise RegNetworkError(
+            "FF_FARM_ENDPOINT غير مضبوط — استخدم reg_listen لاستقبال "
+            "الحسابات من frida_guest.js على المحاكي"
+        )
     timeout = aiohttp.ClientTimeout(total=config.REG_TIMEOUT)
     async with session.post(
-        config.REGISTER_ENDPOINT, json=payload, headers=headers, timeout=timeout,
+        config.FF_FARM_ENDPOINT,
+        json={"uid": str(player_id), "region": region or config.DEFAULT_REGION},
+        headers={"User-Agent": ua or config.USER_AGENT},
         proxy=f"http://{proxy}" if proxy else None,
+        timeout=timeout,
     ) as resp:
-        if resp.status == 403:
-            raise RegBlocked(f"403 blocked for {player_id}")
         if resp.status == 429:
-            raise RegRateLimited(f"429 {resp.headers.get('Retry-After', '?')}")
+            raise RegRateLimited("HTTP 429")
+        if resp.status in (401, 403):
+            raise RegBlocked(f"HTTP {resp.status}")
         if resp.status >= 500:
-            raise RegNetworkError(f"{resp.status} server error")
+            raise RegNetworkError(f"HTTP {resp.status}")
         data = await resp.json(content_type=None)
-        return {
-            "ok": True,
-            "player_id": player_id,
-            "access_token": data.get("access_token", access_token),
-        }
+        uid = data.get("uid") or data.get("player_id")
+        token = data.get("access_token") or data.get("jwt")
+        if not uid or not token:
+            raise RegNetworkError("استجابة مزرعة ناقصة (uid/access_token)")
+        return {"player_id": str(uid), "access_token": str(token)}
 
 
-# ---------- طبقة قاعدة البيانات (reg_queue) ----------
+# ---------- قاعدة بيانات طابور التسجيل ----------
 def _connect():
     return sqlite3.connect(config.DB_PATH, timeout=15)
 
 
 def init_schema():
-    """ينشئ جدول قائمة مهام التسجيل إن لم يوجد."""
     with _connect() as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS reg_queue (
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS {config.REG_QUEUE_TABLE} (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 player_id    TEXT NOT NULL,
                 access_token TEXT,
@@ -127,18 +114,15 @@ def init_schema():
                 finished_at  TEXT
             )
         """)
-        con.execute("CREATE INDEX IF NOT EXISTS idx_regq_status ON reg_queue(status)")
 
 
 def enqueue(count):
-    """يضيف count مهمة تسجيل جديدة ويعيد معرّفاتها."""
     ids = []
     with _connect() as con:
-        for _ in range(count):
-            creds = generate_credentials()
+        for _ in range(max(1, int(count))):
             cur = con.execute(
-                "INSERT INTO reg_queue (player_id, access_token) VALUES (?, ?)",
-                (creds["player_id"], creds["access_token"]),
+                f"INSERT INTO {config.REG_QUEUE_TABLE} (player_id) VALUES (?)",
+                (generate_player_id(),),
             )
             ids.append(cur.lastrowid)
     return ids
@@ -148,7 +132,7 @@ def _get_job(job_id):
     with _connect() as con:
         con.row_factory = sqlite3.Row
         row = con.execute(
-            "SELECT * FROM reg_queue WHERE id=?", (job_id,)
+            f"SELECT * FROM {config.REG_QUEUE_TABLE} WHERE id=?", (job_id,)
         ).fetchone()
     return dict(row) if row else None
 
@@ -171,7 +155,27 @@ def _mark(job_id, status, token=None, attempts=None, proxy=None, error=None):
         if status in ("done", "failed"):
             sets.append("finished_at=datetime('now')")
         vals.append(job_id)
-        con.execute(f"UPDATE reg_queue SET {', '.join(sets)} WHERE id=?", vals)
+        con.execute(
+            f"UPDATE {config.REG_QUEUE_TABLE} SET {', '.join(sets)} WHERE id=?",
+            vals)
+
+
+def _mark_by_player(player_id, status, token=None, error=None):
+    """يُحدّث المهمة المعلقة المطابقة لـ player_id (يستخدمه المستمع)."""
+    with _connect() as con:
+        sets, vals = ["status=?"], [status]
+        if token is not None:
+            sets.append("access_token=?")
+            vals.append(token)
+        if error is not None:
+            sets.append("error=?")
+            vals.append(error)
+        if status in ("done", "failed"):
+            sets.append("finished_at=datetime('now')")
+        vals.append(player_id)
+        con.execute(
+            f"UPDATE {config.REG_QUEUE_TABLE} SET {', '.join(sets)} WHERE player_id=?",
+            vals)
 
 
 def store_account(player_id, access_token):
@@ -184,11 +188,10 @@ def store_account(player_id, access_token):
 
 
 def reg_queue_summary():
-    """تقرير مهام التسجيل حسب الحالة."""
     with _connect() as con:
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            "SELECT status, COUNT(*) n FROM reg_queue GROUP BY status"
+            f"SELECT status, COUNT(*) n FROM {config.REG_QUEUE_TABLE} GROUP BY status"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -197,9 +200,46 @@ def failed_jobs():
     with _connect() as con:
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            "SELECT * FROM reg_queue WHERE status='failed' ORDER BY id"
+            f"SELECT * FROM {config.REG_QUEUE_TABLE} WHERE status='failed' ORDER BY id"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------- المستمع: استقبال حسابات الضيوف من المحاكي ----------
+async def _ingest_handler(request):
+    """POST /ingest — يصل من frida_guest.js: {player_id, access_token, region}."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "bad json"}, status=400)
+    pid = str(data.get("player_id") or data.get("uid") or "").strip()
+    tok = str(data.get("access_token") or data.get("jwt") or "").strip()
+    region = str(data.get("region") or config.DEFAULT_REGION).strip()
+    if not pid.isdigit() or not (5 <= len(pid) <= 15) or not tok:
+        return web.json_response({"ok": False, "error": "invalid fields"}, status=400)
+    stored = store_account(pid, tok)
+    _mark_by_player(pid, "done", token=tok)
+    print(f"[listener] حساب ضيف جديد: {pid} ({region}) — مخزّن: {stored}")
+    return web.json_response({"ok": True, "player_id": pid, "stored": stored})
+
+
+async def _health_handler(request):
+    return web.json_response({"ok": True, "name": "ff-control-ingest"})
+
+
+def start_listener(port=None):
+    """يشغّل المستمع في خيط خلفي (لا يجمّد CLI)."""
+    port = port or config.REG_LISTEN_PORT
+    app = web.Application()
+    app.router.add_post(config.REG_INGEST_PATH, _ingest_handler)
+    app.router.add_get("/health", _health_handler)
+
+    def _runner():
+        web.run_app(app, host=config.REG_LISTEN_HOST, port=port, print=None)
+
+    t = threading.Thread(target=_runner, daemon=True, name="reg-listener")
+    t.start()
+    return t
 
 
 # ---------- مدير التسجيل ----------
@@ -249,26 +289,26 @@ class RegistrationManager:
             if not job:
                 return
             player_id = job["player_id"]
-            token = job["access_token"] or generate_access_token()
             proxy = self._next_proxy(player_id)
             started = time.monotonic()
-            self.on_event(f"[+] تسجيل {player_id} عبر {proxy or 'مباشر'}")
+            self.on_event(f"[+] طلب حساب {player_id} عبر {proxy or 'مباشر'}")
 
             for attempt in range(1, config.REG_MAX_RETRIES + 1):
                 try:
                     async with aiohttp.ClientSession() as session:
-                        res = await register_account(
-                            session, player_id, token, proxy=proxy,
-                            ua=config.USER_AGENT, scope="auto",
+                        creds = await register_account(
+                            session, player_id, region=config.DEFAULT_REGION,
+                            proxy=proxy, ua=config.USER_AGENT,
                         )
-                    token = res.get("access_token", token)
-                    _mark(job_id, "done", token=token, attempts=attempt, proxy=proxy)
-                    store_account(player_id, token)
+                    _mark(job_id, "done", token=creds["access_token"],
+                          attempts=attempt, proxy=proxy)
+                    store_account(creds["player_id"], creds["access_token"])
                     self.results.append(RegResult(
-                        player_id, True, token=token, attempts=attempt,
-                        proxy=proxy or "", duration=time.monotonic() - started,
+                        creds["player_id"], True, token=creds["access_token"],
+                        attempts=attempt, proxy=proxy or "",
+                        duration=time.monotonic() - started,
                     ))
-                    self.on_event(f"[OK] {player_id} جاهز (محاولة {attempt})")
+                    self.on_event(f"[OK] {creds['player_id']} جاهز (محاولة {attempt})")
                     return
 
                 except RegBlocked as e:
@@ -287,7 +327,7 @@ class RegistrationManager:
 
                 except Exception as e:
                     self._report_failure(proxy)
-                    self.on_event(f"[~] {player_id} فشل شبكة ({e}) — إعادة (محاولة {attempt})")
+                    self.on_event(f"[~] {player_id} فشل ({e}) — إعادة (محاولة {attempt})")
                     if attempt < config.REG_MAX_RETRIES:
                         await asyncio.sleep(self._backoff(attempt))
 
@@ -306,19 +346,19 @@ class RegistrationManager:
 
 # ---------- مشغّل الخلفية (لا يجمّد CLI) ----------
 def _requeue_failed():
-    """يعيد جدولة المهام الفاشلة (failed -> pending)."""
     ids = [j["id"] for j in failed_jobs()]
     with _connect() as con:
         for i in ids:
             con.execute(
-                "UPDATE reg_queue SET status='pending', error=NULL, attempts=0 WHERE id=?",
+                f"UPDATE {config.REG_QUEUE_TABLE} SET status='pending', "
+                "error=NULL, attempts=0 WHERE id=?",
                 (i,),
             )
     return ids
 
 
 def start_registration(count=5, proxy_manager=None, retry_failed=False):
-    """يشغّل دورة التسجيل في خيط خلفي ويعيد كائن الخيط للتتبع."""
+    """يشغّل دورة طلب الحسابات من المزرعة في خيط خلفي."""
     init_schema()
     job_ids = _requeue_failed() if retry_failed else enqueue(count)
 
