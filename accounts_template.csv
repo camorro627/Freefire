@@ -1,4 +1,2 @@
 player_id,access_token,status
-1001234567,eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiIxMDAxMjM0NTY3In0.example,active
-1007654321,eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiIxMDA3NjU0MzIxIn0.example,active
-1001112223,eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiIxMDAxMTEyMjIzIn0.example,active
+12345678901,example_token_here,active
