@@ -1,2 +1,1 @@
-# اعتماد واحد فقط — الباقي مكتبات قياسية (asyncio, sqlite3, cmd)
-aiohttp>=3.9
+aiohttp>=3.9.0
