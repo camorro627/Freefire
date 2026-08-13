@@ -1,102 +1,64 @@
 # ============================================================
-# db.py — طبقة sqlite3 لحساباتك المسجلة
+# db.py — إضافات camorro: استيراد/تصدير جماعي + ترقيم صفحات
 # ============================================================
-import sqlite3
-import threading
+def import_accounts_from_csv(path):
+    """استيراد جماعي: player_id,access_token[,status] — سطر لكل حساب.
+    الموجود مسبقاً يُحدَّث توكنه وحالته (UPSERT)."""
+    import csv
+    added = 0
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        next(reader, None)  # تخطي الترويسة
+        with _lock:
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                pid, tok = row[0].strip(), row[1].strip()
+                if not pid or not tok:
+                    continue
+                status = row[2].strip() if len(row) > 2 and row[2].strip() else "active"
+                _c().execute(
+                    """INSERT INTO accounts (player_id, access_token, status)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(player_id) DO UPDATE SET
+                           access_token = excluded.access_token,
+                           status = excluded.status""",
+                    (pid, tok, status),
+                )
+                added += 1
+            _c().commit()
+    return added
 
-_conn = None
-_lock = threading.Lock()
 
-
-def _connect(path):
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS accounts (
-            player_id    TEXT PRIMARY KEY,
-            access_token TEXT NOT NULL,
-            status       TEXT NOT NULL DEFAULT 'active',
-            proxy        TEXT,
-            last_checked TEXT,
-            created_at   TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-        """
-    )
-    conn.commit()
-    return conn
-
-
-def init_db(path="freefire.db"):
-    """تهيئة الاتصال (تُستدعى مرة واحدة عند الإقلاع)."""
-    global _conn
+def export_accounts_to_csv(path):
+    """نسخة احتياطية كاملة (player_id, access_token, status)."""
+    import csv
     with _lock:
-        _conn = _connect(path)
+        rows = _c().execute(
+            "SELECT player_id, access_token, status FROM accounts"
+        ).fetchall()
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["player_id", "access_token", "status"])
+        writer.writerows(rows)
+    return len(rows)
 
 
-def _c():
-    global _conn
-    if _conn is None:
-        init_db()
-    return _conn
-
-
-def add_account(player_id, access_token, proxy=None):
-    """إدراج حساب جديد أو تحديث التوكن لحساب موجود."""
-    with _lock:
-        cur = _c().execute(
-            """INSERT INTO accounts (player_id, access_token, proxy)
-               VALUES (?, ?, ?)
-               ON CONFLICT(player_id) DO UPDATE SET
-                   access_token = excluded.access_token,
-                   proxy = COALESCE(excluded.proxy, accounts.proxy)""",
-            (player_id, access_token, proxy),
-        )
-        _c().commit()
-        return cur.rowcount
-
-
-def remove_account(player_id):
-    with _lock:
-        cur = _c().execute("DELETE FROM accounts WHERE player_id = ?", (player_id,))
-        _c().commit()
-        return cur.rowcount > 0
-
-
-def get_account(player_id):
-    with _lock:
-        row = _c().execute(
-            "SELECT * FROM accounts WHERE player_id = ?", (player_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-
-def get_all_accounts(status=None):
-    """جلب كل الحسابات (أو حسب الحالة) كقائمة قواميس."""
+def count_accounts(status=None):
     with _lock:
         if status:
-            rows = _c().execute(
-                "SELECT * FROM accounts WHERE status = ?", (status,)
-            ).fetchall()
+            row = _c().execute(
+                "SELECT COUNT(*) FROM accounts WHERE status = ?", (status,)
+            ).fetchone()
         else:
-            rows = _c().execute("SELECT * FROM accounts").fetchall()
+            row = _c().execute("SELECT COUNT(*) FROM accounts").fetchone()
+        return row[0]
+
+
+def get_accounts_page(page=1, size=20):
+    with _lock:
+        rows = _c().execute(
+            "SELECT * FROM accounts ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (size, (page - 1) * size),
+        ).fetchall()
         return [dict(r) for r in rows]
-
-
-def set_status(player_id, status):
-    with _lock:
-        _c().execute(
-            "UPDATE accounts SET status = ? WHERE player_id = ?",
-            (status, player_id),
-        )
-        _c().commit()
-
-
-def touch(player_id):
-    """تحديث وقت آخر فحص ناجح."""
-    with _lock:
-        _c().execute(
-            "UPDATE accounts SET last_checked = datetime('now') WHERE player_id = ?",
-            (player_id,),
-        )
-        _c().commit()
